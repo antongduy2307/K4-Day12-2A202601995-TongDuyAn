@@ -160,7 +160,36 @@ def chat(
     ``client_id`` do ``verify_bearer_token`` trả về, nên request không có
     token hợp lệ sẽ dừng ở 401 trước khi chạm vào bất cứ dòng nào ở đây.
     """
-    raise NotImplementedError("TODO (CP3/CP4): cài đặt /chat")
+    # Chặn TRƯỚC khi gọi LLM — tiền mất ở bước gọi LLM. Chặn sau thì vừa
+    # trả tiền vừa trả lỗi cho user.
+    bucket.consume(client_id)
+    guard.check(client_id)
+
+    history = store.history(client_id)
+    result = generate_reply(payload.message, history)
+
+    store.add_turn(client_id, "user", payload.message)
+    store.add_turn(client_id, "assistant", result["text"])
+    guard.record(client_id, result["usd_cost"])
+
+    emit(
+        "chat_completed",
+        client_id=client_id,
+        prompt_tokens=result["prompt_tokens"],
+        completion_tokens=result["completion_tokens"],
+        usd_cost=result["usd_cost"],
+    )
+
+    return {
+        "reply": result["text"],
+        "client_id": client_id,
+        "turns_before": len(history),
+        "usd_cost": result["usd_cost"],
+        "usage": {
+            "prompt": result["prompt_tokens"],
+            "completion": result["completion_tokens"],
+        },
+    }
 
 
 if __name__ == "__main__":
