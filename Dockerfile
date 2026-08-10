@@ -1,36 +1,52 @@
 # ═══════════════════════════════════════════════════════════════════
-# CP2 — Containerization
+# CP2 — Containerization (bản production-ready)
 #
-# Dưới đây là Dockerfile "chạy được nhưng chưa production": một stage,
-# chạy bằng user root, không có health check, base image nặng.
+#   [x] Multi-stage build: `builder` cài dependency, runtime chỉ copy kết quả
+#   [x] Base image slim ở cả hai stage
+#   [x] COPY requirements.txt + pip install TRƯỚC khi COPY source code
+#   [x] Chạy bằng user thường (appuser), không phải root
+#   [x] HEALTHCHECK gọi /healthz
+#   [x] Đọc cổng từ biến môi trường PORT
 #
-# NHIỆM VỤ: sửa file này thành bản production-ready. Yêu cầu:
-#   [ ] Multi-stage build: stage `builder` cài dependency, stage runtime
-#       chỉ copy kết quả sang → image nhỏ hơn, không mang theo compiler.
-#       Cú pháp: `FROM python:3.11-slim AS builder`
-#   [ ] Base image slim (hoặc alpine), không dùng `python:3.11` bản đầy đủ
-#   [ ] COPY requirements.txt và pip install TRƯỚC khi COPY source code
-#       (Docker cache theo layer: sửa 1 dòng code không phải cài lại thư viện)
-#   [ ] Tạo user thường và chuyển sang bằng lệnh `USER` — container chạy
-#       root nghĩa là ai thoát được khỏi app cũng thành root trên host
-#   [ ] Có `HEALTHCHECK` gọi vào endpoint /healthz
-#   [ ] Đọc cổng từ biến môi trường PORT (cloud tự gán cổng, không cố định 8000)
-#
-# Đích cần đạt: image dưới 400MB (bản một stage dưới đây khoảng 1.8GB).
-#
-# Kiểm tra:  pytest tests/test_cp2.py -v
 # Build thử: docker build -t day12-chat:prod .
 #            docker images day12-chat:prod     # xem dung lượng
 # ═══════════════════════════════════════════════════════════════════
 
-FROM python:3.11
+# ── Stage 1: builder ────────────────────────────────────────────────
+# Stage này được phép nặng — nó cài dependency rồi bị vứt đi.
+FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
-COPY . .
+# requirements.txt copy riêng và cài TRƯỚC source code: sửa một dòng code
+# không làm mất cache layer pip install.
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
-RUN pip install -r requirements.txt
+# ── Stage 2: runtime ────────────────────────────────────────────────
+FROM python:3.11-slim AS runtime
+
+# Không ghi .pyc, không buffer stdout — log ra ngoài ngay, không kẹt trong buffer
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Chỉ mang KẾT QUẢ cài đặt sang, không mang theo pip cache hay compiler
+COPY --from=builder /install /usr/local
+
+COPY app ./app
+COPY utils ./utils
+
+# Container chạy root nghĩa là ai thoát được khỏi app cũng thành root trên host
+RUN useradd --create-home --uid 10001 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz').read()" || exit 1
+
+# 0.0.0.0 để gọi được từ ngoài container; ${PORT:-8000} vì cloud tự gán cổng
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
