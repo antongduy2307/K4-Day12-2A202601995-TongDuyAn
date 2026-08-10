@@ -10,8 +10,12 @@ builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+# KHÔNG khai báo startCommand ở đây. Railway chạy startCommand không qua shell,
+# nên "$PORT" đến uvicorn nguyên văn 5 ký tự và deploy chết với
+# "Invalid value for '--port': '$PORT' is not a valid integer".
+# Bỏ trống thì Railway dùng CMD của Dockerfile — CMD đó bọc `sh -c` nên
+# ${PORT:-8000} được shell nội suy đúng.
 healthcheckPath = "/healthz"
-healthcheckTimeout = 30
+healthcheckTimeout = 100
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
