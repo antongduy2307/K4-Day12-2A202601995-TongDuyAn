@@ -1,0 +1,112 @@
+name: CI
+
+# Chạy cả trên pull_request, không chỉ push: bắt lỗi TRƯỚC khi vào nhánh chính
+# mới là phần giá trị nhất của CI.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Push liên tiếp thì huỷ lần chạy cũ, khỏi tốn runner và khỏi deploy chồng nhau.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Chạy checkpoint trên một máy sạch ──────────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Cài dependency
+        run: pip install -r requirements.txt
+
+      - name: Chạy checkpoint
+        env:
+          # Máy CI không có .env. Settings bắt buộc có API_TOKEN, nên truyền
+          # giá trị giả qua biến môi trường — đúng lợi ích của 12-Factor ở CP1:
+          # cùng một code, môi trường khác nhau chỉ khác biến môi trường.
+          API_TOKEN: ci-dummy
+          REDIS_URL: "fake://"
+        # Bỏ test_cp5.py (gọi vào bản deploy đang sống, chạy ở đây luôn chậm
+        # hoặc đỏ) và test_bonus_cicd.py (kiểm tra badge của chính workflow
+        # này — tự tham chiếu vòng tròn).
+        run: |
+          pytest tests/ -v -m "not docker" \
+            --ignore=tests/test_cp5.py \
+            --ignore=tests/test_bonus_cicd.py
+
+  # ── Build image trên máy sạch ──────────────────────────────────────
+  build:
+    name: Build image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Bắt các lỗi kiểu "file này chỉ có trên máy tôi" và .dockerignore loại
+      # nhầm thứ image cần. Runner của GitHub có sẵn Docker.
+      - name: Build Docker image
+        run: docker build -t day12-chat:ci .
+
+      - name: Kiểm tra image dưới 400MB
+        run: |
+          BYTES=$(docker image inspect day12-chat:ci --format '{{.Size}}')
+          MB=$((BYTES / 1024 / 1024))
+          echo "Image size: ${MB}MB"
+          test "$MB" -lt 400
+
+  # ── Chỉ deploy khi mọi thứ xanh ────────────────────────────────────
+  deploy:
+    name: Deploy
+    # needs: đợi test và build xong VÀ pass. Thiếu dòng này thì các job chạy
+    # song song, và code hỏng vẫn lên production trong khi test đang đỏ.
+    needs: [test, build]
+    # if: không có nó thì mỗi lần ai đó mở pull request là một lần deploy.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    env:
+      # Deploy hook của Render là một URL bí mật — gọi vào là deploy. Nó nằm
+      # trong Settings → Secrets and variables → Actions, không nằm trong file
+      # này: dán thẳng vào YAML là nó ở trong lịch sử git vĩnh viễn, xoá ở
+      # commit sau KHÔNG làm nó biến mất.
+      RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+      # URL công khai không phải secret → dùng Variables, không dùng Secrets.
+      PUBLIC_URL: ${{ vars.PUBLIC_URL || 'https://day12-chat-1oub.onrender.com' }}
+    steps:
+      - name: Gọi deploy hook của Render
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
+            echo "::error::Chưa set secret RENDER_DEPLOY_HOOK_URL (Settings → Secrets and variables → Actions)."
+            exit 1
+          fi
+          curl -fsS -X POST "$RENDER_DEPLOY_HOOK_URL" > /dev/null
+          echo "Đã kích hoạt deploy trên Render."
+
+      # Deploy xong mà không kiểm tra thì chỉ biết "lệnh deploy chạy xong",
+      # không biết "service còn sống". curl -f trả mã lỗi khi HTTP không phải
+      # 2xx → job đỏ → biết ngay.
+      - name: Smoke test bản vừa deploy
+        run: |
+          echo "Đợi Render build và khởi động lại..."
+          for i in $(seq 1 20); do
+            sleep 30
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 "$PUBLIC_URL/healthz" || true)
+            echo "lần $i: /healthz → $CODE"
+            if [ "$CODE" = "200" ]; then
+              # /readyz mới chứng minh nối được Redis, /healthz chỉ nói process sống
+              curl -fsS --max-time 60 "$PUBLIC_URL/readyz"
+              echo ""
+              echo "Smoke test đạt."
+              exit 0
+            fi
+          done
+          echo "::error::Service không trả 200 trên /healthz sau 10 phút."
+          exit 1
