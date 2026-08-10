@@ -24,10 +24,12 @@ services:
       - key: REDIS_URL
         fromService:
           name: day12-chat-redis
-          type: redis
+          type: keyvalue
           property: connectionString
 
-  - type: redis
+  # Render đã đổi tên sản phẩm Redis thành "Key Value"; `type: redis` giờ chỉ
+  # còn là alias deprecated.
+  - type: keyvalue
     name: day12-chat-redis
     plan: free
     ipAllowList: []
